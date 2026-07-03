@@ -13,8 +13,16 @@ from ui.config import TREND_LOOKBACK_MIN, VALID_QUOTES
 
 
 def normalize_ticker(raw: str) -> str:
+    """
+    Добавляет котируемую валюту (USDT по умолчанию), если её ещё нет.
+
+    Важно: тикер должен быть ДЛИННЕЕ самой валюты, иначе "BTC" (это просто
+    название монеты, а не пара) ошибочно принимается за уже готовую пару
+    только потому, что оканчивается на "BTC" -- один из VALID_QUOTES.
+    """
     t = raw.strip().upper()
-    if not t.endswith(VALID_QUOTES):
+    already_quoted = any(t.endswith(q) and len(t) > len(q) for q in VALID_QUOTES)
+    if not already_quoted:
         t += "USDT"
     return t
 

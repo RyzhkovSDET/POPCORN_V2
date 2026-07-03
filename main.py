@@ -12,6 +12,8 @@ from storage.coins_storage import add_coin, load_coins, remove_coin
 from ui.analysis_sidebar import render_analysis_sidebar
 from ui.config import (
     BUY_HINTS,
+    CHART_CANDLES_LIMIT,
+    CHART_INTERVAL,
     COL_KEYS,
     COL_WIDTHS,
     HOURLY_CANDLES_LIMIT,
@@ -202,8 +204,13 @@ render_analysis_sidebar()
 # ---------------------------------------------------------------------------
 st.subheader("📈 Chart")
 if st.session_state.coins:
-    selected = st.selectbox("Select Coin", st.session_state.coins)
-    chart_df = fetch_data_for_ticker(selected)
+    # График следует за монетой, выбранной кликом в таблице (тот же
+    # selected_coin, что открывает боковую панель анализа) -- отдельного
+    # выпадающего списка больше нет. Если ещё ничего не кликали, по
+    # умолчанию берётся первая монета из watchlist.
+    chart_ticker = st.session_state.selected_coin or st.session_state.coins[0]
+    st.caption(f"Монета: **{chart_ticker.replace('USDT', '')}** -- клик по названию монеты в таблице меняет график")
+    chart_df = fetch_data_for_ticker(chart_ticker, interval=CHART_INTERVAL, limit=CHART_CANDLES_LIMIT)
     if not chart_df.empty:
         fig = go.Figure()
         fig.add_trace(go.Candlestick(

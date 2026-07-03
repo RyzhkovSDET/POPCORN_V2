@@ -25,6 +25,8 @@ VOLUME_WINDOWS_HOURS = (1, 3, 6, 24)
 ANALYSIS_LOOKBACK_DAYS = 90
 FIBONACCI_SWING_DAYS = 30
 TREND_LOOKBACK_MIN = 30    # окно для стрелки тренда (в минутах, на 1m свечах)
+CHART_INTERVAL = "30m"     # таймфрейм свечей на графике внизу страницы
+CHART_CANDLES_LIMIT = 100
 
 # ---------------------------------------------------------------------------
 # Столбцы таблицы watchlist
