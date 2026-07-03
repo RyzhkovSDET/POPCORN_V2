@@ -21,7 +21,7 @@ from ui.config import (
     PATTERN_LOOKBACK,
     SLOW_METRICS_TTL_SEC,
 )
-from ui.formatters import format_break_col, macd_signal_str, trend_arrow_30m
+from ui.formatters import format_breakout_col, macd_signal_str, trend_arrow_30m
 
 
 def calculate_score(rsi, price, ema_fast, ema_slow, macd_val, macd_sig) -> int:
@@ -129,7 +129,10 @@ def compute_break_counters(daily_df: pd.DataFrame, lookback_days: int = BREAKOUT
             min_date = day_date
             running_low = day["low"]
 
-    return {"min_count": min_count, "min_date": min_date, "max_count": max_count, "max_date": max_date}
+    return {
+        "min_count": min_count, "min_date": min_date, "min_price": running_low if min_count else None,
+        "max_count": max_count, "max_date": max_date, "max_price": running_high if max_count else None,
+    }
 
 
 def compute_volume_change_pct_hours(hourly_df: pd.DataFrame, hours: int = 1):
@@ -182,23 +185,21 @@ def compute_slow_metrics(ticker: str, compact_mode: bool):
         daily_df = None
 
     break_counters = compute_break_counters(daily_df)
-    min_col = format_break_col(
-        break_counters["min_count"] if break_counters else 0,
-        break_counters["min_date"] if break_counters else None, "min", compact=compact_mode,
-    )
-    max_col = format_break_col(
-        break_counters["max_count"] if break_counters else 0,
-        break_counters["max_date"] if break_counters else None, "max", compact=compact_mode,
-    )
+    breakout_col = format_breakout_col(break_counters, compact=compact_mode)
 
     return {
-        "rsi": rsi,
-        "atr": atr,
+        # готовые HTML-ячейки для отрисовки таблицы
         "trend_col": trend_col,
         "macd_col": macd_col,
+        "breakout_col": breakout_col,
+        # сырые значения -- нужны и для расчётов, и для текстового отчёта
+        # "Копировать анализ" в боковой панели
+        "rsi": rsi,
+        "atr": atr,
+        "macd_val": macd_val,
+        "macd_sig": macd_sig,
         "score": score,
         "pattern_bias": pattern_bias,
         "forecast_score": forecast_score,
-        "min_col": min_col,
-        "max_col": max_col,
+        "break_counters": break_counters,
     }
