@@ -1,7 +1,10 @@
 """
-Funding Rate и Open Interest. Основной источник -- Binance Futures API.
-Если Binance недоступен (регионная блокировка HTTP 451 или сетевая
-ошибка) -- автоматически переключается на Bybit (линейные перпетуалы).
+Funding Rate и Open Interest. Пробует по очереди Binance Futures -> Bybit
+-> OKX. Честно: в отличие от klines (где у Binance есть выделенный
+"чистый" домен для рыночных данных без комплаенс-блокировки), для
+фьючерсных метрик такого документированного обхода нет ни у одной из
+трёх бирж -- если все три откажут, это, скорее всего, реальное
+регуляторное ограничение по региону, а не баг.
 """
 import logging
 from typing import Optional, Tuple
@@ -11,17 +14,20 @@ import streamlit as st
 
 logger = logging.getLogger(__name__)
 
-BINANCE_FUTURES_URL = "https://fapi.binance.com"
-BYBIT_URL = "https://api.bybit.com"
 REQUEST_TIMEOUT = 5
+_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 _OI_PERIOD_TO_BYBIT = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h", "1d": "1d"}
 
 
+# ---------------------------------------------------------------------------
+# Funding rate
+# ---------------------------------------------------------------------------
+
 def _funding_binance(ticker: str) -> float:
     resp = requests.get(
-        f"{BINANCE_FUTURES_URL}/fapi/v1/premiumIndex",
-        params={"symbol": ticker}, timeout=REQUEST_TIMEOUT,
+        "https://fapi.binance.com/fapi/v1/premiumIndex",
+        params={"symbol": ticker}, headers=_HEADERS, timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
     return float(resp.json()["lastFundingRate"]) * 100
@@ -29,9 +35,9 @@ def _funding_binance(ticker: str) -> float:
 
 def _funding_bybit(ticker: str) -> float:
     resp = requests.get(
-        f"{BYBIT_URL}/v5/market/funding/history",
+        "https://api.bybit.com/v5/market/funding/history",
         params={"category": "linear", "symbol": ticker, "limit": 1},
-        timeout=REQUEST_TIMEOUT,
+        headers=_HEADERS, timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
     rows = resp.json().get("result", {}).get("list", [])
@@ -40,25 +46,50 @@ def _funding_bybit(ticker: str) -> float:
     return float(rows[0]["fundingRate"]) * 100
 
 
+def _to_okx_inst(ticker: str) -> str:
+    for quote in ("USDT", "USDC", "USD"):
+        if ticker.endswith(quote) and len(ticker) > len(quote):
+            return f"{ticker[: -len(quote)]}-{quote}-SWAP"
+    return ticker
+
+
+def _funding_okx(ticker: str) -> float:
+    resp = requests.get(
+        "https://www.okx.com/api/v5/public/funding-rate",
+        params={"instId": _to_okx_inst(ticker)},
+        headers=_HEADERS, timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    data = payload.get("data", [])
+    if not data:
+        raise ValueError(f"OKX не вернул funding rate ({payload.get('msg')})")
+    return float(data[0]["fundingRate"]) * 100
+
+
+_FUNDING_SOURCES = [("Binance", _funding_binance), ("Bybit", _funding_bybit), ("OKX", _funding_okx)]
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_funding_rate(ticker: str) -> Optional[float]:
-    """Текущая ставка финансирования в процентах. Binance -> fallback Bybit -> None."""
-    try:
-        return _funding_binance(ticker)
-    except Exception as e:
-        logger.warning(f"Binance funding rate недоступен для {ticker} ({e}), пробую Bybit...")
+    """Текущая ставка финансирования в процентах, или None если все источники недоступны."""
+    for name, fn in _FUNDING_SOURCES:
         try:
-            return _funding_bybit(ticker)
-        except Exception as e2:
-            logger.warning(f"Funding rate недоступен для {ticker} нигде: {e2}")
-            return None
+            return fn(ticker)
+        except Exception as e:
+            logger.warning(f"{name} funding rate недоступен для {ticker}: {e}")
+    return None
 
+
+# ---------------------------------------------------------------------------
+# Open interest
+# ---------------------------------------------------------------------------
 
 def _oi_binance(ticker: str, period: str) -> Tuple[Optional[float], Optional[float]]:
     resp = requests.get(
-        f"{BINANCE_FUTURES_URL}/futures/data/openInterestHist",
+        "https://fapi.binance.com/futures/data/openInterestHist",
         params={"symbol": ticker, "period": period, "limit": 2},
-        timeout=REQUEST_TIMEOUT,
+        headers=_HEADERS, timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -73,12 +104,10 @@ def _oi_binance(ticker: str, period: str) -> Tuple[Optional[float], Optional[flo
 
 def _oi_bybit(ticker: str, period: str) -> Tuple[Optional[float], Optional[float]]:
     resp = requests.get(
-        f"{BYBIT_URL}/v5/market/open-interest",
-        params={
-            "category": "linear", "symbol": ticker,
-            "intervalTime": _OI_PERIOD_TO_BYBIT.get(period, "1h"), "limit": 2,
-        },
-        timeout=REQUEST_TIMEOUT,
+        "https://api.bybit.com/v5/market/open-interest",
+        params={"category": "linear", "symbol": ticker,
+                "intervalTime": _OI_PERIOD_TO_BYBIT.get(period, "1h"), "limit": 2},
+        headers=_HEADERS, timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
     rows = resp.json().get("result", {}).get("list", [])
@@ -92,15 +121,30 @@ def _oi_bybit(ticker: str, period: str) -> Tuple[Optional[float], Optional[float
     return latest_oi, ((latest_oi - prev_oi) / prev_oi) * 100
 
 
+def _oi_okx(ticker: str, period: str) -> Tuple[Optional[float], Optional[float]]:
+    """OKX отдаёт только текущий снимок OI без истории -- тренд вернуть не можем (None)."""
+    resp = requests.get(
+        "https://www.okx.com/api/v5/public/open-interest",
+        params={"instId": _to_okx_inst(ticker)},
+        headers=_HEADERS, timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    data = payload.get("data", [])
+    if not data:
+        raise ValueError(f"OKX не вернул open interest ({payload.get('msg')})")
+    return float(data[0]["oi"]), None
+
+
+_OI_SOURCES = [("Binance", _oi_binance), ("Bybit", _oi_bybit), ("OKX", _oi_okx)]
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_open_interest_change(ticker: str, period: str = "1h") -> Tuple[Optional[float], Optional[float]]:
-    """(latest_oi, pct_change). Binance -> fallback Bybit -> (None, None)."""
-    try:
-        return _oi_binance(ticker, period)
-    except Exception as e:
-        logger.warning(f"Binance OI недоступен для {ticker} ({e}), пробую Bybit...")
+    """(latest_oi, pct_change). Пробует Binance -> Bybit -> OKX -> (None, None)."""
+    for name, fn in _OI_SOURCES:
         try:
-            return _oi_bybit(ticker, period)
-        except Exception as e2:
-            logger.warning(f"OI недоступен для {ticker} нигде: {e2}")
-            return None, None
+            return fn(ticker, period)
+        except Exception as e:
+            logger.warning(f"{name} OI недоступен для {ticker}: {e}")
+    return None, None
