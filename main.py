@@ -7,6 +7,7 @@ import streamlit as st
 
 from storage.coins_storage import add_coin, load_coins
 from ui.analysis_sidebar import render_analysis_sidebar
+from ui.backtest_lab import render_watchlist_backtest_summary
 from ui.chart import render_chart
 from ui.formatters import normalize_ticker
 from ui.quick_guide import render_quick_guide
@@ -55,6 +56,7 @@ st.markdown('<div style="margin-top:-28px"></div>', unsafe_allow_html=True)  # �
 # Основные блоки страницы
 # ---------------------------------------------------------------------------
 render_watchlist()
+render_watchlist_backtest_summary()
 render_analysis_sidebar()
 render_chart()
 render_quick_guide()

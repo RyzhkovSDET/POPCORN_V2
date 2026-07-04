@@ -17,6 +17,7 @@ from api.get_data import fetch_data_for_ticker, fetch_latest_bar, is_binance_kno
 from api import ws_stream
 from indicators.signal_zones import forecast_str, pattern_cell, rsi_str, signal_str
 from storage.coins_storage import load_coin_click_counts, load_coins, remove_coin, set_coin_click_count
+from ui.alerts import check_and_fire_alerts, render_alerts_log, render_alerts_toggle
 from ui.config import (
     COL_KEYS,
     COL_WIDTHS,
@@ -357,11 +358,18 @@ def _render_watchlist_table():
         elif oi_value is not None:
             st.session_state.oi_history[ticker] = {"value": oi_value, "pct": oi_pct_change}
 
+    # Алерты проверяем здесь -- после того, как raw_by_ticker полностью
+    # собран (score/forecast_score уже на месте), и на каждом цикле
+    # обновления фрагмента, то есть с той же частотой REFRESH_SEC, что и
+    # сама таблица.
+    check_and_fire_alerts(raw_by_ticker)
+
     live_indicator = "⚡ live (WebSocket)" if ws_stream.is_connected() else "🔄 REST-опрос"
     st.caption(
         f"Монет загружено: {len(watchlist)} (показывается максимум {MAX_ROWS}) -- "
         f"обновление раз в {REFRESH_SEC}с -- цена: {live_indicator}"
     )
+    render_alerts_log()
 
     if failed_tickers:
         with st.expander(f"⚠️ Не удалось загрузить {len(failed_tickers)} монет(у) -- нажми, чтобы удалить", expanded=True):
@@ -466,4 +474,5 @@ def render_watchlist():
     """Единая точка входа -- вызывается из main.py. Селекторы + автообновляемая таблица."""
     _init_watchlist_session_state()
     _render_selectors_row()
+    render_alerts_toggle()
     _render_watchlist_table()

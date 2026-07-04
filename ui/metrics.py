@@ -13,6 +13,7 @@ from ta.trend import ADXIndicator, EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
 
 from api.get_data import fetch_data_for_ticker
+from indicators.scoring import calculate_score
 from indicators.signal_zones import atr_str, ema_str, macd_cell
 from ui.config import (
     BREAKOUT_LOOKBACK_DAYS,
@@ -26,19 +27,6 @@ from ui.config import (
     TREND_WINDOW_DEFAULT,
 )
 from ui.formatters import format_breakout_col, trend_arrow_30m
-
-
-def calculate_score(rsi, price, ema_fast, ema_slow, macd_val, macd_sig) -> int:
-    """Континуальный скор 0-100 из RSI, разрыва EMA, цены к EMA и MACD momentum."""
-    score = 50.0
-    score += max(-25, min(25, (50 - rsi) * 0.5))
-    ema_diff_pct = ((ema_fast - ema_slow) / ema_slow) * 100
-    score += max(-15, min(15, ema_diff_pct * 10))
-    price_diff_pct = ((price - ema_fast) / ema_fast) * 100
-    score += max(-10, min(10, price_diff_pct * 5))
-    macd_diff_pct = ((macd_val - macd_sig) / price) * 100
-    score += max(-15, min(15, macd_diff_pct * 50))
-    return int(round(max(0, min(100, score))))
 
 
 def detect_pattern(df: pd.DataFrame, lookback: int = PATTERN_LOOKBACK):

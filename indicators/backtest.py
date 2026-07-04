@@ -1,24 +1,36 @@
 """
-Простой бэктест-фреймворк -- проверяет на исторических свечах, есть ли у
-Score (0-100 из ui.metrics.calculate_score) хоть какая-то предсказательная
+Бэктест-фреймворк -- проверяет на исторических свечах, есть ли у Score
+(0-100 из indicators.scoring.calculate_score) хоть какая-то предсказательная
 сила, или это просто взвешенная сумма индикаторов без реального edge.
 
-Логика: считаем Score по всей истории векторизованно (RSI/EMA/MACD),
-затем симулируем простую long-only стратегию -- вход, когда Score
-поднимается выше buy_threshold, выход, когда падает ниже sell_threshold.
-Результат сравнивается с buy&hold за тот же период.
+Три уровня проверки, от простого к честному:
 
-Это НЕ профессиональный бэктестер (нет шортов, частичных позиций,
+1. backtest_score_signal()   -- одна пара порогов (buy/sell) на одном
+   непрерывном отрезке истории. Быстрый первый взгляд, но легко обмануться:
+   одна прибыльная комбинация чисел на одном отрезке ничего не доказывает.
+
+2. grid_search_thresholds()  -- перебирает МНОГО комбинаций порогов на том
+   же отрезке. Если прибыльна только одна случайно подобранная пара, а
+   вокруг сплошные минусы -- это переобучение на конкретные слайдеры, а не
+   реальный edge.
+
+3. walk_forward_validation() -- делит историю на несколько последовательных
+   периодов и тестирует ОДНИ И ТЕ ЖЕ (фиксированные) пороги на каждом
+   отдельно. Показывает, работает ли сигнал стабильно в разных рыночных
+   условиях (тренд/флэт/разные фазы), а не только в одном периоде, который
+   случайно попал в общий бэктест.
+
+Это всё ещё НЕ профессиональный бэктестер (нет шортов, частичных позиций,
 проскальзывания сверх фиксированной комиссии) -- цель дать быструю и
-честную первую оценку "работает сигнал или нет", а не заменить
-полноценную систему валидации стратегий.
+честную оценку "работает сигнал или нет", а не заменить полноценную
+систему валидации стратегий.
 """
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import pandas as pd
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, MACD
+
+from indicators.scoring import compute_score_series
 
 
 @dataclass
@@ -51,53 +63,26 @@ class BacktestResult:
         return self.total_return_pct - self.buy_hold_return_pct
 
 
-def _compute_score_series(df: pd.DataFrame) -> pd.Series:
-    """
-    Та же формула, что и в ui.metrics.calculate_score(), но векторизованная
-    по всему датафрейму сразу (для скорости на длинной истории). Веса и
-    клампы должны оставаться синхронизированы вручную с ui.metrics --
-    при изменении весов Score там же поправь и здесь.
-    """
-    close = df["close"]
-    rsi = RSIIndicator(close, window=14).rsi()
-    ema_fast = EMAIndicator(close, window=20).ema_indicator()
-    ema_slow = EMAIndicator(close, window=50).ema_indicator()
-    macd_ind = MACD(close)
-    macd_val, macd_sig = macd_ind.macd(), macd_ind.macd_signal()
-
-    score = pd.Series(50.0, index=close.index)
-    score = score + ((50 - rsi) * 0.5).clip(-25, 25)
-    ema_diff_pct = ((ema_fast - ema_slow) / ema_slow) * 100
-    score = score + (ema_diff_pct * 10).clip(-15, 15)
-    price_diff_pct = ((close - ema_fast) / ema_fast) * 100
-    score = score + (price_diff_pct * 5).clip(-10, 10)
-    macd_diff_pct = ((macd_val - macd_sig) / close) * 100
-    score = score + (macd_diff_pct * 50).clip(-15, 15)
-    return score.clip(0, 100)
-
-
-def backtest_score_signal(
+def _simulate(
     df: pd.DataFrame,
-    buy_threshold: float = 70,
-    sell_threshold: float = 30,
-    fee_pct: float = 0.1,
-    warmup_bars: int = 60,
+    score: pd.Series,
+    buy_threshold: float,
+    sell_threshold: float,
+    fee_pct: float,
+    warmup_bars: int,
 ) -> Optional[BacktestResult]:
     """
-    Симулирует long-only стратегию по Score на исторических свечах.
-
-    fee_pct -- комиссия за сделку в процентах, списывается на входе и
-    выходе (2 x fee_pct за круг), чтобы не показывать нереалистично
-    хороший результат без учёта торговых издержек.
-    warmup_bars -- сколько первых баров пропустить, пока EMA(50)/RSI не
-    "разогреются" до стабильных значений.
+    Общее ядро симуляции long-only стратегии по уже посчитанному Score.
+    Вынесено отдельно от backtest_score_signal(), чтобы grid_search_thresholds()
+    мог считать Score ОДИН раз для всей истории и затем прогонять через
+    десятки комбинаций порогов без повторного расчёта RSI/EMA/MACD на
+    каждую комбинацию -- иначе grid-search на 100+ ячеек был бы неоправданно
+    медленным.
     """
     if df is None or len(df) < warmup_bars + 20:
         return None
 
-    score = _compute_score_series(df)
     close = df["close"]
-
     result = BacktestResult(fee_pct=fee_pct)
     in_position = False
     entry_price = None
@@ -142,3 +127,142 @@ def backtest_score_signal(
     result.win_rate_pct = (len(wins) / result.num_trades * 100) if result.num_trades else None
 
     return result
+
+
+def backtest_score_signal(
+    df: pd.DataFrame,
+    buy_threshold: float = 70,
+    sell_threshold: float = 30,
+    fee_pct: float = 0.1,
+    warmup_bars: int = 60,
+) -> Optional[BacktestResult]:
+    """
+    Симулирует long-only стратегию по Score на исторических свечах: вход,
+    когда Score поднимается выше buy_threshold, выход, когда падает ниже
+    sell_threshold. Результат сравнивается с buy&hold за тот же период.
+
+    fee_pct -- комиссия за сделку в процентах, списывается на входе и
+    выходе (2 x fee_pct за круг), чтобы не показывать нереалистично
+    хороший результат без учёта торговых издержек.
+    warmup_bars -- сколько первых баров пропустить, пока EMA(50)/RSI не
+    "разогреются" до стабильных значений.
+    """
+    if df is None or len(df) < warmup_bars + 20:
+        return None
+    score = compute_score_series(df)
+    return _simulate(df, score, buy_threshold, sell_threshold, fee_pct, warmup_bars)
+
+
+# ---------------------------------------------------------------------------
+# Grid-search: много комбинаций порогов на одном отрезке истории
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GridCell:
+    buy_threshold: int
+    sell_threshold: int
+    result: BacktestResult
+
+
+def grid_search_thresholds(
+    df: pd.DataFrame,
+    buy_range=range(55, 91, 5),
+    sell_range=range(10, 46, 5),
+    fee_pct: float = 0.1,
+    warmup_bars: int = 60,
+    min_trades: int = 3,
+) -> List[GridCell]:
+    """
+    Перебирает комбинации порогов buy/sell (buy всегда строго больше sell)
+    и считает результат бэктеста для каждой. Score считается ОДИН раз для
+    всей истории (см. _simulate), а не заново на каждую комбинацию.
+
+    Комбинации с меньше min_trades сделок отбрасываются -- одна-две сделки
+    ничего не доказывают, их прибыльность может быть чистой случайностью.
+
+    Возвращает список ячеек, отсортированный по edge_vs_buy_hold (лучшие
+    первыми). Используется, чтобы увидеть, есть ли РЕАЛЬНЫЙ edge у сигнала
+    в широком диапазоне порогов, или прибыльна только одна случайно
+    подобранная пара чисел (переобучение на конкретный слайдер).
+    """
+    if df is None or len(df) < warmup_bars + 20:
+        return []
+
+    score = compute_score_series(df)
+    cells: List[GridCell] = []
+    for buy_th in buy_range:
+        for sell_th in sell_range:
+            if sell_th >= buy_th:
+                continue
+            result = _simulate(df, score, buy_th, sell_th, fee_pct, warmup_bars)
+            if result is not None and result.num_trades >= min_trades:
+                cells.append(GridCell(buy_th, sell_th, result))
+
+    cells.sort(key=lambda c: -c.result.edge_vs_buy_hold_pct)
+    return cells
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward: одни и те же пороги на нескольких последовательных периодах
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FoldResult:
+    fold_index: int
+    start_date: object
+    end_date: object
+    result: Optional[BacktestResult]
+
+
+def _split_folds(df: pd.DataFrame, n_folds: int) -> List[pd.DataFrame]:
+    """Делит df на n_folds последовательных НЕПЕРЕСЕКАЮЩИХСЯ сегментов по
+    времени (без перемешивания -- порядок времени важен для честной
+    проверки). Последний сегмент забирает остаток, если длина не делится
+    ровно."""
+    fold_size = len(df) // n_folds
+    folds = []
+    for i in range(n_folds):
+        start = i * fold_size
+        end = (i + 1) * fold_size if i < n_folds - 1 else len(df)
+        folds.append(df.iloc[start:end])
+    return folds
+
+
+def walk_forward_validation(
+    df: pd.DataFrame,
+    buy_threshold: float = 70,
+    sell_threshold: float = 30,
+    fee_pct: float = 0.1,
+    n_folds: int = 3,
+    warmup_bars: int = 60,
+) -> List[FoldResult]:
+    """
+    Делит историю на n_folds последовательных периодов и тестирует
+    ФИКСИРОВАННЫЕ пороги (не подбирает их заново на каждом периоде -- это
+    было бы подгонкой) на каждом отдельно. Пороги по умолчанию (70/30) --
+    те же, что предлагаются пользователю как дефолт в UI, специально не
+    оптимальные "задним числом" под конкретную монету.
+
+    Если стратегия обгоняет buy&hold в большинстве периодов -- это куда
+    более сильный аргумент в пользу реального edge, чем один хороший
+    результат на всей истории целиком (где ранние прибыльные периоды могли
+    просто "перевесить" поздние убыточные при суммарном подсчёте).
+    """
+    if df is None or len(df) < warmup_bars * n_folds + 20 * n_folds:
+        return []
+
+    folds = _split_folds(df, n_folds)
+    out = []
+    for i, fold in enumerate(folds):
+        # На маленьком фолде warmup_bars может не влезть -- уменьшаем его
+        # пропорционально вместо того, чтобы просто вернуть "недостаточно
+        # данных" для всего периода.
+        fold_warmup = min(warmup_bars, max(0, len(fold) - 21))
+        result = backtest_score_signal(fold, buy_threshold, sell_threshold, fee_pct, warmup_bars=fold_warmup)
+        out.append(FoldResult(
+            fold_index=i,
+            start_date=fold.index[0] if len(fold) else None,
+            end_date=fold.index[-1] if len(fold) else None,
+            result=result,
+        ))
+    return out

@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
 
+from api.coinapi_data import fetch_asset_overview, fetch_orderbook_consensus
 from api.get_data import fetch_data_for_ticker, fetch_from_source, SOURCE_NAMES
+from api.liquidations_aggregator import fetch_liquidation_consensus
 from indicators.analysis import (
     GUIDES,
     calculate_risk_reward,
@@ -16,7 +18,14 @@ from indicators.analysis import (
     strength_label,
 )
 from indicators.backtest import backtest_score_signal
-from ui.config import ANALYSIS_LOOKBACK_DAYS, FIBONACCI_SWING_DAYS, SLOW_METRICS_INTERVAL
+from indicators.conclusion import build_full_conclusion, compute_entry_levels, HORIZONS
+from indicators.signal_zones import cell
+from storage.api_key_storage import delete_api_key, load_api_key, save_api_key
+from storage.coinapi_cache_storage import age_seconds, load_result, save_result
+from storage.coinapi_usage_storage import DAILY_LIMIT, get_usage_today
+from ui.backtest_lab import render_backtest_lab
+from ui.config import ANALYSIS_LOOKBACK_DAYS, FIBONACCI_SWING_DAYS, SLOW_METRICS_INTERVAL, VALID_QUOTES
+from ui.metrics import get_forecast_score
 
 
 _PATTERN_LABELS = {"bull": "бычий (ПОК)", "bear": "медвежий (ПРД)", "neutral": "нейтральный (НЕЙТ)"}
@@ -245,9 +254,213 @@ def _render_backtest_section(ticker: str):
     )
 
 
+def _split_base_quote(ticker: str):
+    """BTCUSDT -> ("BTC", "USDT") -- нужно для Order Book консенсуса
+    (CoinAPI требует базовый и котируемый актив отдельно)."""
+    for quote in VALID_QUOTES:
+        if ticker.endswith(quote) and len(ticker) > len(quote):
+            return ticker[: -len(quote)], quote
+    return ticker, "USDT"
+
+
+def _render_coinapi_key_section():
+    """
+    Поле ввода CoinAPI-ключа -- используется ТОЛЬКО доп. данными в
+    "Заключении по монете" ниже, не основной таблицей watchlist (см.
+    api/coinapi_data.py -- почему именно так разделено).
+
+    Как только в поле оказывается непустой ключ -- он СРАЗУ (без отдельной
+    кнопки "Сохранить") шифруется и сохраняется на диск (storage.api_key_storage)
+    и сразу же готов к использованию -- не нужно ни нажимать что-то
+    дополнительно, ни вводить его заново при следующем запуске приложения.
+    Явную кнопку оставили только для УДАЛЕНИЯ -- это разрушающее действие,
+    ему стоит оставаться осознанным кликом, а не происходить само собой.
+    """
+    if "coinapi_key" not in st.session_state:
+        st.session_state.coinapi_key = load_api_key() or ""
+    if "_coinapi_key_persisted" not in st.session_state:
+        # То, что реально уже лежит на диске прямо сейчас -- чтобы не
+        # перезаписывать файл на каждый rerun одним и тем же значением
+        # ключа, а только когда оно реально изменилось.
+        st.session_state._coinapi_key_persisted = st.session_state.coinapi_key
+
+    with st.expander("🔐 CoinAPI ключ (для Заключения по монете)", expanded=False):
+        st.caption(
+            "Ключ используется только по кнопке в разделе «Заключение по монете» "
+            "ниже (не автоматически при каждом клике на монету) -- так дневной "
+            "лимит CoinAPI (100 запросов/день) расходуется только когда ты сам "
+            "этого хочешь. Как только вставишь ключ -- он сразу сохраняется "
+            "(зашифрованным) и используется, повторно ничего нажимать не нужно."
+        )
+        key_input = st.text_input(
+            "API-ключ", value=st.session_state.coinapi_key, type="password", key="coinapi_key_input",
+        )
+        st.session_state.coinapi_key = key_input
+
+        cleaned = key_input.strip()
+        if cleaned and cleaned != st.session_state._coinapi_key_persisted:
+            save_api_key(cleaned)
+            st.session_state._coinapi_key_persisted = cleaned
+            st.toast("🔐 Ключ CoinAPI сохранён (зашифрован на диске).")
+
+        if st.button("🗑️ Удалить сохранённый ключ"):
+            delete_api_key()
+            st.session_state.coinapi_key = ""
+            st.session_state.coinapi_key_input = ""
+            st.session_state._coinapi_key_persisted = ""
+            st.success("Сохранённый ключ удалён.")
+            st.rerun()
+
+
+# Интервал и лимит свечей для прогноза на каждый горизонт заключения.
+# Короткие горизонты -- на более мелких свечах (чувствительнее), длинные --
+# на более крупных (менее шумно). Согласовано по духу с
+# ui.config.FORECAST_HORIZON_OPTIONS (та же логика для столбца "Прогноз"
+# в таблице), но задано отдельно -- набор горизонтов здесь другой (5, а не
+# те, что в селекторе таблицы), и заключение всегда считает эти 5
+# независимо от того, что выбрано в селекторе таблицы watchlist.
+_CONCLUSION_HORIZONS = [
+    ("1ч", "15m", 100),
+    ("4ч", "15m", 100),
+    ("12ч", "1h", 150),
+    ("1д", "1h", 150),
+    ("2д", "4h", 150),
+]
+
+# Зоны цвета для бейджа рекомендации -- переиспользует ту же палитру
+# indicators.signal_zones, что и весь остальной интерфейс (зелёный/красный/
+# светло-серый для нейтрали), а не отдельный набор цветов только для этого блока.
+_REC_ZONES = {"LONG": "green", "SHRT": "red", "NEUT": "white"}
+
+
+def _render_conclusion_section(ticker: str):
+    """
+    Заключение по монете: два текста (текущее состояние + логика прогноза)
+    и таблица рекомендаций на 5 горизонтов (1ч/4ч/12ч/1д/2д). Показывается
+    перед "Скопировать анализ".
+
+    CoinAPI-часть (Order Book консенсус + Asset overview) запрашивается
+    СТРОГО по нажатию кнопки рядом с заголовком -- никогда автоматически,
+    даже при повторном клике на ту же монету. Результат сохраняется на
+    диск (storage.coinapi_cache_storage) на 4 часа: если зайти на эту же
+    монету в течение этого окна -- видно сохранённый результат без нового
+    запроса; если прошло больше 4 часов -- данные считаются устаревшими и
+    просто не показываются (пусто), новый запрос НЕ уходит сам по себе,
+    нужно снова нажать кнопку.
+    """
+    header_col, button_col = st.columns([3, 2])
+    with header_col:
+        st.markdown(
+            "**🧭 Заключение по монете**",
+            help=(
+                "Читаемый вывод по всем показателям монеты + ориентировочная "
+                "вероятность движения и рекомендация (LONG/SHRT/NEUT) на "
+                "1ч/4ч/12ч/1д/2д. Эвристика на основе текущих технических "
+                "сигналов, не финансовая рекомендация."
+            ),
+        )
+
+    metrics = st.session_state.selected_coin_metrics
+    if not metrics:
+        st.caption("Нет данных из таблицы watchlist -- кликни на монету заново.")
+        return
+
+    api_key = st.session_state.get("coinapi_key")
+    cached = load_result(ticker)  # None, если ничего не сохранено или сохранённому больше 4 часов
+
+    with button_col:
+        button_label = "🔄 Обновить CoinAPI" if cached else "🔍 Запросить CoinAPI"
+        clicked = st.button(
+            button_label,
+            key=f"coinapi_fetch_{ticker}",
+            disabled=not api_key,
+            use_container_width=True,
+            help="Order Book консенсус нескольких бирж. Запрос уходит ТОЛЬКО по этому клику -- никогда автоматически.",
+        )
+
+    if clicked and api_key:
+        base, quote = _split_base_quote(ticker)
+        with st.spinner("Собираю Order Book со всех бирж через CoinAPI..."):
+            fresh_overview = fetch_asset_overview(base, api_key)
+            fresh_orderbook = fetch_orderbook_consensus(base, quote, api_key)
+        save_result(ticker, fresh_overview, fresh_orderbook)
+        cached = {"coinapi_overview": fresh_overview, "orderbook": fresh_orderbook}
+        if fresh_overview is None and fresh_orderbook is None:
+            if get_usage_today() >= DAILY_LIMIT:
+                st.caption("⚠️ Дневной лимит CoinAPI (100/день) похоже исчерпан -- попробуй завтра.")
+            else:
+                st.caption("CoinAPI не ответил (ключ/доступ/сеть) -- уровни ниже посчитаны только по структуре цены.")
+
+    if not api_key:
+        st.caption("Введи CoinAPI-ключ выше, чтобы получить Order Book консенсус нескольких бирж.")
+    elif cached is None:
+        st.caption("Нет сохранённых данных CoinAPI по этой монете (или прошло больше 4 часов) -- нажми кнопку выше.")
+    else:
+        hours_ago = (age_seconds(ticker) or 0) / 3600
+        st.caption(f"Данные CoinAPI обновлены {hours_ago:.1f} ч назад (хранятся 4 ч).")
+
+    coinapi_overview = cached.get("coinapi_overview") if cached else None
+    orderbook = cached.get("orderbook") if cached else None
+
+    with st.spinner("Считаю прогноз по горизонтам..."):
+        forecasts = {
+            label: get_forecast_score(ticker, interval=interval, limit=limit)
+            for label, interval, limit in _CONCLUSION_HORIZONS
+        }
+
+    # Структурные уровни (свинг-хай/лоу по дневным свечам) -- та же логика,
+    # что уже используется в структурном анализе выше (find_support_resistance).
+    # Пересчитываем отдельно от вкладок бирж, т.к. там уровни строятся по
+    # КАЖДОЙ бирже отдельно (для сравнения), а здесь нужен один общий
+    # ориентир по дефолтному источнику -- дёшево благодаря общему кэшу
+    # fetch_data_for_ticker (ttl 600с для дневных свечей).
+    try:
+        daily_df = fetch_data_for_ticker(ticker, interval="1d", limit=ANALYSIS_LOOKBACK_DAYS)
+        support, resistance = find_support_resistance(daily_df)
+        near_support, near_resistance = nearest_levels(support, resistance)
+        structural_support = near_support.price if near_support else None
+        structural_resistance = near_resistance.price if near_resistance else None
+    except Exception:
+        structural_support, structural_resistance = None, None
+
+    # Ликвидации -- публичные источники (Binance WS + OKX REST), ключ CoinAPI
+    # не нужен и квоту не расходует, поэтому запрашиваются всегда, а не
+    # только по кнопке (в отличие от CoinAPI-части выше).
+    liquidations = fetch_liquidation_consensus(ticker)
+
+    entry_levels = compute_entry_levels(
+        price=metrics.get("price"), atr=metrics.get("atr"),
+        structural_support=structural_support, structural_resistance=structural_resistance,
+        orderbook=orderbook,
+    )
+
+    conclusion = build_full_conclusion(metrics, forecasts, ticker, entry_levels, orderbook, liquidations, coinapi_overview)
+
+    st.markdown(conclusion["text"])
+    st.markdown("**🎯 Моя логика прогноза**")
+    st.markdown(conclusion["logic_text"])
+    st.caption(f"🔐 {get_usage_today()}/{DAILY_LIMIT}")
+
+    st.caption("Рекомендации по горизонтам (не финансовая рекомендация):")
+    for horizon in HORIZONS:
+        rec = conclusion["recommendations"][horizon]
+        badge = cell(rec["rec"], _REC_ZONES[rec["rec"]])
+        price_bits = ""
+        if rec["entry"] is not None:
+            price_bits = f" @ {rec['entry']:,.4f}"
+            if rec["stop"] is not None:
+                price_bits += f" · Stop {rec['stop']:,.4f}"
+        st.markdown(
+            f"**{horizon}**: {badge}{price_bits} &nbsp;&nbsp; "
+            f"🔼 {rec['up']}% / 🔽 {rec['down']}%",
+            unsafe_allow_html=True,
+        )
+
+
 def render_analysis_sidebar():
     with st.sidebar:
         st.header("🔍 Анализ монеты")
+        _render_coinapi_key_section()
         ticker = st.session_state.selected_coin
 
         if not ticker:
@@ -269,6 +482,10 @@ def render_analysis_sidebar():
 
         st.divider()
         _render_backtest_section(ticker)
+        render_backtest_lab(ticker)
+
+        st.divider()
+        _render_conclusion_section(ticker)
 
         st.divider()
         st.markdown("**📋 Скопировать анализ**")

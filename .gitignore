@@ -1,2 +1,10 @@
 __pycache__/
 *.pyc
+
+# CoinAPI-ключ (зашифрован, но всё равно не место в git) и локальный
+# ключ шифрования -- см. storage/api_key_storage.py
+data/coinapi_key.enc
+data/.coinapi_secret
+
+# Дисковый кэш результатов CoinAPI по монетам (4ч) -- см. storage/coinapi_cache_storage.py
+data/coinapi_cache.json

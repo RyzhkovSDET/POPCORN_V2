@@ -4,3 +4,4 @@ requests>=2.31
 ta>=0.11
 plotly>=5.22
 websockets>=12.0
+cryptography>=42.0
