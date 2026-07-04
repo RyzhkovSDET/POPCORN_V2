@@ -1,23 +1,34 @@
 """
 Загрузка OHLCV-свечей. Пробует источники по очереди, пока один не сработает:
 1) Binance Spot -- обычно лучшее покрытие пар, но блокирует некоторые страны (HTTP 451), например США.
-2) Bybit -- тоже не обслуживает США (HTTP 403 в этом случае).
+2) Coinbase -- доступен в США, но покрытие пар меньше.
 3) Kraken -- официально доступен в США, используется как последний resort.
 
 Если ты в США (или другом регионе, где заблокированы офшорные биржи) --
-приложение всё равно будет работать через Kraken, просто набор пар у него
-меньше, чем у Binance/Bybit.
+приложение всё равно будет работать через Coinbase/Kraken, просто набор пар
+у них меньше, чем у Binance.
 """
 import logging
-from typing import Optional
 
 import pandas as pd
 import requests
 import streamlit as st
 
+from api import ws_stream
+
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 10
+
+# Если конкретный тикер уже дал HTTP 400 (invalid symbol) на конкретном
+# источнике -- это не транзиентная ошибка, а постоянный факт "этой пары тут
+# нет" (например HYPEUSDT не торгуется на Binance Spot вообще). Без этого
+# кэша каждый из ~5 разных таймфреймов, которые дёргает приложение для
+# одного тикера (слоу-метрики, дневные свечи, прогноз и т.д.), заново
+# натыкался бы на те же 2 гарантированно провальных запроса (Binance,
+# Coinbase) прежде чем дойти до рабочего источника -- лишние задержки и шум
+# в логах. Ключ: (source_name, ticker).
+_known_bad_symbol: set = set()
 
 _BINANCE_COLUMNS = [
     "time", "open", "high", "low", "close", "volume",
@@ -25,11 +36,6 @@ _BINANCE_COLUMNS = [
 ]
 _NUMERIC_COLUMNS = ["open", "high", "low", "close", "volume", "qav"]
 
-_INTERVAL_TO_BYBIT = {
-    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
-    "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720",
-    "1d": "D", "1w": "W",
-}
 _INTERVAL_TO_KRAKEN = {
     "1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080,
 }
@@ -58,32 +64,6 @@ def _fetch_binance(ticker: str, interval: str, limit: int) -> pd.DataFrame:
         raise ValueError("Некорректные числовые данные в ответе Binance")
 
     df["time"] = pd.to_datetime(df["time"], unit="ms")
-    df.set_index("time", inplace=True)
-    return df
-
-
-def _fetch_bybit(ticker: str, interval: str, limit: int) -> pd.DataFrame:
-    bybit_interval = _INTERVAL_TO_BYBIT.get(interval)
-    if bybit_interval is None:
-        raise ValueError(f"Интервал {interval} не поддержан для Bybit")
-
-    resp = requests.get(
-        "https://api.bybit.com/v5/market/kline",
-        params={"category": "spot", "symbol": ticker, "interval": bybit_interval, "limit": limit},
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=REQUEST_TIMEOUT,
-    )
-    resp.raise_for_status()
-    payload = resp.json()
-    rows = payload.get("result", {}).get("list", [])
-    if not rows:
-        raise ValueError(f"Bybit не вернул данные (retCode={payload.get('retCode')}, retMsg={payload.get('retMsg')})")
-
-    rows = list(reversed(rows))  # Bybit отдаёт от новых к старым
-    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume", "qav"])
-    for col in ["open", "high", "low", "close", "volume", "qav"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["time"] = pd.to_datetime(pd.to_numeric(df["time"]), unit="ms")
     df.set_index("time", inplace=True)
     return df
 
@@ -206,7 +186,6 @@ def _fetch_coinbase(ticker: str, interval: str, limit: int) -> pd.DataFrame:
 
 _SOURCES = [
     ("Binance", _fetch_binance),
-    ("Bybit", _fetch_bybit),
     ("Coinbase", _fetch_coinbase),
     ("Kraken", _fetch_kraken),
 ]
@@ -220,7 +199,7 @@ def fetch_from_source(source: str, ticker: str, interval: str = "1d", limit: int
     Загружает klines с конкретной биржи БЕЗ автоматического fallback --
     используется, когда нужно явно сравнить разные источники (например,
     вкладки в боковой панели анализа), а не молча взять первый рабочий.
-    source: одно из значений SOURCE_NAMES ('Binance' | 'Bybit' | 'Coinbase' | 'Kraken').
+    source: одно из значений SOURCE_NAMES ('Binance' | 'Coinbase' | 'Kraken').
     Кэш 10 минут -- используется с дневными свечами, чаще не нужно.
     """
     sources_map = dict(_SOURCES)
@@ -234,9 +213,15 @@ def _fetch_with_fallback(ticker: str, interval: str, limit: int) -> pd.DataFrame
     """Пробует источники по очереди (см. _SOURCES). Raises ValueError, если все отказали."""
     errors = []
     for name, fetch_fn in _SOURCES:
+        if (name, ticker) in _known_bad_symbol:
+            continue  # уже знаем: эта пара тут не торгуется вообще, не тратим запрос
         try:
             return fetch_fn(ticker, interval, limit)
         except Exception as e:
+            # HTTP 400 = "invalid symbol" -- постоянный факт, а не временный сбой сети.
+            # Другие ошибки (таймаут, 5xx, rate limit) остаются транзиентными и не кэшируются.
+            if "400 Client Error" in str(e):
+                _known_bad_symbol.add((name, ticker))
             logger.warning(f"{name} недоступен для {ticker}: {e}")
             errors.append(f"{name}: {e}")
 
@@ -282,11 +267,32 @@ def fetch_data_for_ticker(ticker: str, interval: str = "1m", limit: int = 100) -
     return _fetch_cached_slow(ticker, interval, limit)
 
 
-def get_latest_price(ticker: str) -> Optional[float]:
-    """Последняя цена закрытия, или None при ошибке (не роняет приложение)."""
-    try:
-        df = fetch_data_for_ticker(ticker, limit=1)
-        return float(df["close"].iloc[-1]) if not df.empty else None
-    except Exception as e:
-        logger.warning(f"Не удалось получить цену {ticker}: {e}")
-        return None
+def is_binance_known_bad(ticker: str) -> bool:
+    """
+    True, если этот тикер уже давал HTTP 400 (invalid symbol) на Binance --
+    используется api.ws_stream, чтобы не пытаться подписываться на
+    WebSocket-стрим заведомо несуществующей на Binance Spot пары (например
+    HYPEUSDT, который торгуется только на Kraken). Один невалидный символ
+    в комбинированном WS-стриме иначе мог бы сорвать подписку сразу для
+    всех остальных тикеров тоже.
+    """
+    return ("Binance", ticker) in _known_bad_symbol
+
+
+def fetch_latest_bar(ticker: str) -> pd.DataFrame:
+    """
+    Быстрый путь для 'горячего' запроса (текущая цена + объём последней и
+    предыдущей 1m-свечи) -- именно это нужно ui.watchlist на каждом цикле
+    обновления (каждые REFRESH_SEC секунд на каждую монету), а не полная
+    история в 100 свечей.
+
+    Сначала пробует живой WebSocket-кэш (api.ws_stream) -- если там есть
+    хотя бы 2 свечи и данные не протухли, отдаёт их МГНОВЕННО, без единого
+    HTTP-запроса на эту монету. Если WS недоступен, ещё не готов для этого
+    тикера, или данные протухли -- прозрачный откат на обычный REST-путь
+    (fetch_data_for_ticker), как было раньше до добавления WS.
+    """
+    ws_df = ws_stream.get_live_candles(ticker)
+    if ws_df is not None and len(ws_df) >= 2:
+        return ws_df
+    return fetch_data_for_ticker(ticker, interval="1m", limit=100)

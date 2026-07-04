@@ -15,6 +15,8 @@ from typing import List, TypedDict
 import requests
 import streamlit as st
 
+from api.coingecko_data import throttle_coingecko
+
 logger = logging.getLogger(__name__)
 
 COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
@@ -34,6 +36,10 @@ class ScreenerCandidate(TypedDict):
 def _fetch_market_pool() -> List[ScreenerCandidate]:
     """Топ-100 монет по капитализации с CoinGecko -- общий пул для бычьего и медвежьего скринера."""
     try:
+        # Тот же общий троттлинг на весь процесс, что и в api/coingecko_data.py --
+        # раньше этот запрос шёл в обход него и мог наложиться по времени на
+        # параллельные запросы объёма из watchlist, провоцируя пачки HTTP 429.
+        throttle_coingecko()
         resp = requests.get(
             f"{COINGECKO_BASE_URL}/coins/markets",
             params={

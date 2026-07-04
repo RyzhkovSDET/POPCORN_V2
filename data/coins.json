@@ -1,5 +1,4 @@
 [
-  "ETHUSDT",
   "ZECUSDT",
   "WLDUSDT",
   "BTCUSDT",
@@ -7,9 +6,9 @@
   "ORDIUSDT",
   "JTOUSDT",
   "HYPEUSDT",
-  "PUMPUSDT",
   "ASTERUSDT",
   "XRPUSDT",
-  "FARTCOINUSDT",
-  "ADAUSDT"
+  "ADAUSDT",
+  "NEARUSDT",
+  "NOTUSDT"
 ]

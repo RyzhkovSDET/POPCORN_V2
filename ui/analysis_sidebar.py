@@ -13,8 +13,10 @@ from indicators.analysis import (
     find_swing_range,
     nearest_levels,
     point_of_control,
+    strength_label,
 )
-from ui.config import ANALYSIS_LOOKBACK_DAYS, FIBONACCI_SWING_DAYS
+from indicators.backtest import backtest_score_signal
+from ui.config import ANALYSIS_LOOKBACK_DAYS, FIBONACCI_SWING_DAYS, SLOW_METRICS_INTERVAL
 
 
 _PATTERN_LABELS = {"bull": "бычий (ПОК)", "bear": "медвежий (ПРД)", "neutral": "нейтральный (НЕЙТ)"}
@@ -46,6 +48,7 @@ def build_analysis_report(ticker: str, metrics: dict, daily_df: pd.DataFrame) ->
             "ТАБЛИЦА WATCHLIST",
             f"Изменение 24ч: {_fmt(metrics.get('pct_change_24h'), '%')}",
             f"RSI: {_fmt(metrics.get('rsi'), digits=1)}",
+            f"EMA(20/50): {_fmt(metrics.get('ema_fast'), digits=4)} / {_fmt(metrics.get('ema_slow'), digits=4)}",
             f"MACD: {_fmt(metrics.get('macd_val'), digits=4)} / сигнальная {_fmt(metrics.get('macd_sig'), digits=4)}",
             f"ATR: {_fmt(metrics.get('atr'), digits=4)}",
             f"Volume (последняя свеча): {_fmt(metrics.get('last_volume'), digits=2)}",
@@ -59,7 +62,8 @@ def build_analysis_report(ticker: str, metrics: dict, daily_df: pd.DataFrame) ->
             f"Open Interest: {_fmt(metrics.get('oi_value'), digits=0)} ({_fmt(metrics.get('oi_pct_change'), '%')})",
             f"Сигнал (скор 0-100): {metrics.get('score', 'н/д')}",
             f"Pattern: {_PATTERN_LABELS.get(metrics.get('pattern_bias'), 'н/д')}",
-            f"4ч Прогноз (скор 0-100): {_fmt(metrics.get('forecast_score'), digits=0)}",
+            f"Прогноз ({st.session_state.get('forecast_horizon_label', '4ч')}, скор 0-100): "
+            f"{_fmt(metrics.get('forecast_score'), digits=0)}",
         ]
         bc = metrics.get("break_counters") or {}
         if bc.get("min_count"):
@@ -81,14 +85,14 @@ def build_analysis_report(ticker: str, metrics: dict, daily_df: pd.DataFrame) ->
     lines.append("Сопротивление (снизу вверх):")
     if resistance:
         for lvl in resistance:
-            lines.append(f"  - {lvl.price:,.4f} (сила {lvl.strength})")
+            lines.append(f"  - {lvl.price:,.4f} (сила {strength_label(lvl.strength)})")
     else:
         lines.append("  - не найдено")
 
     lines.append("Поддержка (сверху вниз):")
     if support:
         for lvl in support:
-            lines.append(f"  - {lvl.price:,.4f} (сила {lvl.strength})")
+            lines.append(f"  - {lvl.price:,.4f} (сила {strength_label(lvl.strength)})")
     else:
         lines.append("  - не найдено")
 
@@ -134,11 +138,11 @@ def _render_analysis_body(daily_df: pd.DataFrame):
     if resistance:
         st.caption("Сопротивление (сверху вниз):")
         for lvl in reversed(resistance):
-            st.markdown(f"🔴 {lvl.price:,.4f} &nbsp; _(сила {lvl.strength})_", unsafe_allow_html=True)
+            st.markdown(f"🔴 {lvl.price:,.4f} &nbsp; _(сила {strength_label(lvl.strength)})_", unsafe_allow_html=True)
     if support:
         st.caption("Поддержка (сверху вниз):")
         for lvl in support:
-            st.markdown(f"🟢 {lvl.price:,.4f} &nbsp; _(сила {lvl.strength})_", unsafe_allow_html=True)
+            st.markdown(f"🟢 {lvl.price:,.4f} &nbsp; _(сила {strength_label(lvl.strength)})_", unsafe_allow_html=True)
     if not support and not resistance:
         st.caption("Уровни не найдены -- возможно, слишком мало истории.")
     with st.expander("ℹ️ Как пользоваться"):
@@ -186,6 +190,61 @@ def _render_analysis_body(daily_df: pd.DataFrame):
         st.write(GUIDES["volume_profile"]["full"])
 
 
+def _render_backtest_section(ticker: str):
+    """
+    Бэктест Score-сигнала на исторических 30m свечах -- честная проверка,
+    есть ли у "Сигнала" из watchlist реальный edge, или это просто цифра.
+    Сравнивает простую стратегию (вход >=70, выход <=30) с buy&hold за тот
+    же период.
+    """
+    st.markdown("**🧪 Бэктест сигнала (Score)**", help="Проверка на истории: обгоняет ли Score buy&hold")
+
+    col_a, col_b = st.columns(2)
+    buy_th = col_a.slider("Порог входа", 50, 90, 70, key=f"bt_buy_{ticker}")
+    sell_th = col_b.slider("Порог выхода", 10, 50, 30, key=f"bt_sell_{ticker}")
+
+    try:
+        bt_df = fetch_data_for_ticker(ticker, interval=SLOW_METRICS_INTERVAL, limit=1000)
+    except Exception as e:
+        st.caption(f"Не удалось загрузить историю для бэктеста: {e}")
+        return
+
+    result = backtest_score_signal(bt_df, buy_threshold=buy_th, sell_threshold=sell_th)
+    if result is None:
+        st.caption("Недостаточно истории для бэктеста (нужно больше 30-минутных свечей).")
+        return
+
+    if result.num_trades == 0:
+        st.caption("За доступный период не было ни одной сделки по этим порогам -- попробуй понизить порог входа.")
+        return
+
+    period_days = (bt_df.index[-1] - bt_df.index[0]).total_seconds() / 86400
+    st.caption(f"Период: ~{period_days:.0f} дней, {result.num_trades} сделок, комиссия {result.fee_pct}% за сторону.")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Стратегия", f"{result.total_return_pct:+.1f}%")
+    m2.metric("Buy & Hold", f"{result.buy_hold_return_pct:+.1f}%")
+    m3.metric("Win rate", f"{result.win_rate_pct:.0f}%" if result.win_rate_pct is not None else "н/д")
+
+    if result.edge_vs_buy_hold_pct > 0:
+        st.markdown(
+            f"🟢 Сигнал Score работал: выиграл на **{result.edge_vs_buy_hold_pct:+.1f}%** "
+            f"против простого удержания монеты."
+        )
+    else:
+        st.markdown(
+            f"🔴 Сигнал Score не работал: проиграл **{abs(result.edge_vs_buy_hold_pct):.1f}%** "
+            f"простому удержанию монеты на этом периоде."
+        )
+    st.caption(f"Макс. просадка стратегии: {result.max_drawdown_pct:.1f}%")
+
+    st.caption(
+        "⚠️ Это простой long-only бэктест без проскальзывания и частичных позиций -- "
+        "не финансовая рекомендация. Разные монеты и периоды могут дать разный результат; "
+        "тестируй регулярно, а не один раз."
+    )
+
+
 def render_analysis_sidebar():
     with st.sidebar:
         st.header("🔍 Анализ монеты")
@@ -207,6 +266,9 @@ def render_analysis_sidebar():
                     st.warning(f"{source_name} недоступен для {ticker}: {e}")
                     continue
                 _render_analysis_body(daily_df)
+
+        st.divider()
+        _render_backtest_section(ticker)
 
         st.divider()
         st.markdown("**📋 Скопировать анализ**")

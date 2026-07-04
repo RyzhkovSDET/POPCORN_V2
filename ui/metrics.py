@@ -13,15 +13,19 @@ from ta.trend import ADXIndicator, EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
 
 from api.get_data import fetch_data_for_ticker
+from indicators.signal_zones import atr_str, ema_str, macd_cell
 from ui.config import (
     BREAKOUT_LOOKBACK_DAYS,
     DAILY_CANDLES_LIMIT,
     HTF_INTERVAL,
     HTF_LIMIT,
     PATTERN_LOOKBACK,
+    SLOW_METRICS_CANDLES_LIMIT,
+    SLOW_METRICS_INTERVAL,
     SLOW_METRICS_TTL_SEC,
+    TREND_WINDOW_DEFAULT,
 )
-from ui.formatters import format_breakout_col, macd_signal_str, trend_arrow_30m
+from ui.formatters import format_breakout_col, trend_arrow_30m
 
 
 def calculate_score(rsi, price, ema_fast, ema_slow, macd_val, macd_sig) -> int:
@@ -73,10 +77,23 @@ def detect_pattern(df: pd.DataFrame, lookback: int = PATTERN_LOOKBACK):
     return "none", "neutral"
 
 
-def get_4h_forecast_score(ticker: str, pattern_bias: str = "neutral"):
-    """Мультитаймфрейм-прогноз на 4ч: EMA-тренд + RSI + ADX (15m) + паттерн (1m)."""
+def get_forecast_score(ticker: str, interval: str = HTF_INTERVAL, limit: int = HTF_LIMIT):
+    """
+    Мультитаймфрейм-прогноз (горизонт настраивается в UI, см.
+    ui.config.FORECAST_HORIZON_OPTIONS): EMA-тренд + RSI + ADX + паттерн --
+    ВСЁ считается на одном и том же таймфрейме (interval).
+
+    Короткие горизонты (2ч/4ч) считаются на 15-минутках. Длинные (6ч/12ч/1д)
+    на 15м были бы слишком шумными для такого дальнего прогноза, поэтому
+    вызывающий код (compute_slow_metrics) передаёт interval="1h" для них --
+    более сглаженные данные, надёжнее для длинного горизонта.
+
+    Паттерн детектируется на ТЕХ ЖЕ свечах (interval), что и остальные
+    компоненты прогноза -- таймфреймы всегда согласованы, независимо от
+    выбранного горизонта.
+    """
     try:
-        htf_df = fetch_data_for_ticker(ticker, interval=HTF_INTERVAL, limit=HTF_LIMIT)
+        htf_df = fetch_data_for_ticker(ticker, interval=interval, limit=limit)
         if htf_df.empty or len(htf_df) < 50:
             return None
 
@@ -85,6 +102,7 @@ def get_4h_forecast_score(ticker: str, pattern_bias: str = "neutral"):
         ema_slow = EMAIndicator(close, window=50).ema_indicator().iloc[-1]
         rsi = RSIIndicator(close, window=14).rsi().iloc[-1]
         adx = ADXIndicator(high, low, close, window=14).adx().iloc[-1]
+        _, pattern_bias = detect_pattern(htf_df)
 
         score = 50.0
         ema_gap_pct = ((ema_fast - ema_slow) / ema_slow) * 100
@@ -155,13 +173,31 @@ def compute_volume_change_pct_hours(hourly_df: pd.DataFrame, hours: int = 1):
 
 
 @st.cache_data(ttl=SLOW_METRICS_TTL_SEC, show_spinner=False)
-def compute_slow_metrics(ticker: str, compact_mode: bool):
+def compute_slow_metrics(
+    ticker: str,
+    interval: str = SLOW_METRICS_INTERVAL,
+    trend_window: int = TREND_WINDOW_DEFAULT,
+    forecast_interval: str = HTF_INTERVAL,
+    forecast_limit: int = HTF_LIMIT,
+):
     """
     Медленный блок метрик (RSI/MACD/ATR/Trend/Сигнал/Pattern/Мин/Макс) --
     пересчитывается не чаще раза в SLOW_METRICS_TTL_SEC секунд, даже если
     сама страница перерисовывается каждые REFRESH_SEC секунд ради цены.
+
+    interval -- таймфрейм для RSI/EMA/MACD/ATR/Pattern/Trend, выбирается
+    пользователем в UI (см. ui.config.SLOW_METRICS_TIMEFRAME_OPTIONS).
+    trend_window -- сколько свечей назад сравнивать для столбца Trend
+    (см. ui.config.TREND_WINDOW_OPTIONS).
+    forecast_interval/forecast_limit -- таймфрейм и лимит свечей для
+    столбца "Прогноз", зависят от выбранного горизонта (см.
+    ui.config.FORECAST_HORIZON_OPTIONS) -- 2ч/4ч считаются на 15м, а
+    6ч/12ч/1д на 1ч (менее шумно для дальнего горизонта).
+    Все параметры входят в ключ кэша Streamlit автоматически (это просто
+    аргументы функции), так что переключение любого из них в интерфейсе
+    сразу тянет новые данные, а не старые закэшированные.
     """
-    df = fetch_data_for_ticker(ticker)
+    df = fetch_data_for_ticker(ticker, interval=interval, limit=SLOW_METRICS_CANDLES_LIMIT)
     if df.empty or len(df) < 20:
         return None
 
@@ -173,11 +209,13 @@ def compute_slow_metrics(ticker: str, compact_mode: bool):
     macd_val, macd_sig = macd_ind.macd().iloc[-1], macd_ind.macd_signal().iloc[-1]
     atr = AverageTrueRange(df["high"], df["low"], close, window=14).average_true_range().iloc[-1]
 
-    trend_col = trend_arrow_30m(df)
-    macd_col = macd_signal_str(macd_val, macd_sig)
+    trend_col = trend_arrow_30m(df, window=trend_window)
+    macd_col = macd_cell(macd_val, macd_sig, close.iloc[-1])
+    ema_col = ema_str(ema_fast, ema_slow)
+    atr_col = atr_str(atr, close.iloc[-1])
     score = calculate_score(rsi, close.iloc[-1], ema_fast, ema_slow, macd_val, macd_sig)
-    _, pattern_bias = detect_pattern(df)
-    forecast_score = get_4h_forecast_score(ticker, pattern_bias)
+    pattern_name, pattern_bias = detect_pattern(df)
+    forecast_score = get_forecast_score(ticker, interval=forecast_interval, limit=forecast_limit)
 
     try:
         daily_df = fetch_data_for_ticker(ticker, interval="1d", limit=DAILY_CANDLES_LIMIT)
@@ -185,20 +223,25 @@ def compute_slow_metrics(ticker: str, compact_mode: bool):
         daily_df = None
 
     break_counters = compute_break_counters(daily_df)
-    breakout_col = format_breakout_col(break_counters, compact=compact_mode)
+    breakout_col = format_breakout_col(break_counters)
 
     return {
         # готовые HTML-ячейки для отрисовки таблицы
         "trend_col": trend_col,
         "macd_col": macd_col,
+        "ema_col": ema_col,
+        "atr_col": atr_col,
         "breakout_col": breakout_col,
         # сырые значения -- нужны и для расчётов, и для текстового отчёта
         # "Копировать анализ" в боковой панели
         "rsi": rsi,
         "atr": atr,
+        "ema_fast": ema_fast,
+        "ema_slow": ema_slow,
         "macd_val": macd_val,
         "macd_sig": macd_sig,
         "score": score,
+        "pattern_name": pattern_name,
         "pattern_bias": pattern_bias,
         "forecast_score": forecast_score,
         "break_counters": break_counters,

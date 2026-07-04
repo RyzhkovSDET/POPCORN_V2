@@ -6,15 +6,20 @@ APP_CSS = """
     .block-container { padding-top: 1rem; padding-bottom: 1rem; max-width: 100%; }
     [data-testid="stHorizontalBlock"] { gap: 0.2rem; align-items: center; }
     [data-testid="column"] { padding: 1px 2px !important; }
+    /* Вложенная пара колонок (кружочек-выбор + таблетка-имя) внутри ячейки
+       Coin -- без этого у неё был свой вертикальный gap как у отдельного
+       "элемента" Streamlit, из-за чего строка раздувалась по высоте. */
+    div[class*="st-key-watchlist_table"] [data-testid="column"] [data-testid="stHorizontalBlock"] {
+        gap: 0.15rem !important; margin: 0 !important;
+    }
     [data-testid="column"] p { font-size: 0.72rem; white-space: nowrap; margin-bottom: 0; }
     div.stButton > button { padding: 0px 6px; height: 22px; font-size: 0.68rem; min-height: 22px;
         white-space: nowrap !important; overflow: visible !important; }
+    div[class*="st-key-coinname_"] button, div[class*="st-key-pick_"] button {
+        white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important;
+    }
     div[data-testid="stForm"] { padding: 0.6rem 0.8rem; }
     .quick-guide { font-size: 0.78em; line-height: 1.45; }
-    .buy-hint { color: #2ecc71; font-size: 0.62rem; font-weight: 600; white-space: nowrap; }
-    .sell-hint { color: #e74c3c; font-size: 0.62rem; font-weight: 600; white-space: nowrap; }
-    .group-header { text-align: center; font-size: 0.69rem; font-weight: 700;
-        color: rgba(255,255,255,0.55); text-transform: uppercase; letter-spacing: 0.03em; }
     .col-header { cursor: help; border-bottom: 1px dotted rgba(255,255,255,0.35); font-size: 0.69rem; }
     /* Кнопка удаления -- текстовая, красная, без иконок и подтверждений */
     div[class*="st-key-del_"] button {
@@ -39,9 +44,9 @@ APP_CSS = """
     div[class*="st-key-screener_bear_"] button:hover { filter: brightness(1.12); }
     div[class*="st-key-screener_bull_"] button:disabled,
     div[class*="st-key-screener_bear_"] button:disabled { opacity: 0.5 !important; color: #ffffff !important; }
-    button[title^="Открыть анализ"] { font-weight: 600 !important; text-decoration: underline; text-underline-offset: 3px; }
     .st-key-watchlist_table [data-testid="stHorizontalBlock"] {
         border-bottom: 1px solid rgba(255, 255, 255, 0.07); border-radius: 4px; transition: background 0.1s ease;
+        position: relative;
     }
     .st-key-watchlist_table [data-testid="stHorizontalBlock"]:nth-of-type(even) { background: rgba(255, 255, 255, 0.025); }
     .st-key-watchlist_table [data-testid="stHorizontalBlock"]:hover { background: rgba(255, 255, 255, 0.07); }

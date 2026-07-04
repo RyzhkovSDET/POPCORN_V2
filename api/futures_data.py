@@ -1,10 +1,10 @@
 """
-Funding Rate и Open Interest. Пробует по очереди Binance Futures -> Bybit
--> OKX. Честно: в отличие от klines (где у Binance есть выделенный
-"чистый" домен для рыночных данных без комплаенс-блокировки), для
-фьючерсных метрик такого документированного обхода нет ни у одной из
-трёх бирж -- если все три откажут, это, скорее всего, реальное
-регуляторное ограничение по региону, а не баг.
+Funding Rate и Open Interest. Пробует по очереди Binance Futures -> OKX.
+Честно: в отличие от klines (где у Binance есть выделенный "чистый" домен
+для рыночных данных без комплаенс-блокировки), для фьючерсных метрик
+такого документированного обхода нет ни у одной из бирж -- если обе
+откажут, это, скорее всего, реальное регуляторное ограничение по региону,
+а не баг.
 """
 import logging
 from typing import Optional, Tuple
@@ -17,7 +17,17 @@ logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT = 5
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-_OI_PERIOD_TO_BYBIT = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h", "1d": "1d"}
+# HTTP 451 от Binance -- это не транзиентная ошибка, а постоянная региональная
+# блокировка (США и др.): она не "чинится" сама через минуту, поэтому нет
+# смысла долбить Binance каждые 60 секунд заново для КАЖДОЙ монеты -- это
+# просто шум в логах и небольшая лишняя задержка. Как только поймали 451
+# один раз, запоминаем на весь процесс и сразу идём на OKX.
+_binance_futures_blocked = [False]
+
+
+def _mark_binance_blocked_if_geo(exc: Exception) -> None:
+    if "451" in str(exc):
+        _binance_futures_blocked[0] = True
 
 
 # ---------------------------------------------------------------------------
@@ -31,19 +41,6 @@ def _funding_binance(ticker: str) -> float:
     )
     resp.raise_for_status()
     return float(resp.json()["lastFundingRate"]) * 100
-
-
-def _funding_bybit(ticker: str) -> float:
-    resp = requests.get(
-        "https://api.bybit.com/v5/market/funding/history",
-        params={"category": "linear", "symbol": ticker, "limit": 1},
-        headers=_HEADERS, timeout=REQUEST_TIMEOUT,
-    )
-    resp.raise_for_status()
-    rows = resp.json().get("result", {}).get("list", [])
-    if not rows:
-        raise ValueError("Bybit не вернул funding rate")
-    return float(rows[0]["fundingRate"]) * 100
 
 
 def _to_okx_inst(ticker: str) -> str:
@@ -67,16 +64,20 @@ def _funding_okx(ticker: str) -> float:
     return float(data[0]["fundingRate"]) * 100
 
 
-_FUNDING_SOURCES = [("Binance", _funding_binance), ("Bybit", _funding_bybit), ("OKX", _funding_okx)]
+_FUNDING_SOURCES = [("Binance", _funding_binance), ("OKX", _funding_okx)]
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_funding_rate(ticker: str) -> Optional[float]:
     """Текущая ставка финансирования в процентах, или None если все источники недоступны."""
     for name, fn in _FUNDING_SOURCES:
+        if name == "Binance" and _binance_futures_blocked[0]:
+            continue  # уже знаем, что регион заблокирован -- не тратим запрос
         try:
             return fn(ticker)
         except Exception as e:
+            if name == "Binance":
+                _mark_binance_blocked_if_geo(e)
             logger.warning(f"{name} funding rate недоступен для {ticker}: {e}")
     return None
 
@@ -102,25 +103,6 @@ def _oi_binance(ticker: str, period: str) -> Tuple[Optional[float], Optional[flo
     return latest_oi, ((latest_oi - prev_oi) / prev_oi) * 100
 
 
-def _oi_bybit(ticker: str, period: str) -> Tuple[Optional[float], Optional[float]]:
-    resp = requests.get(
-        "https://api.bybit.com/v5/market/open-interest",
-        params={"category": "linear", "symbol": ticker,
-                "intervalTime": _OI_PERIOD_TO_BYBIT.get(period, "1h"), "limit": 2},
-        headers=_HEADERS, timeout=REQUEST_TIMEOUT,
-    )
-    resp.raise_for_status()
-    rows = resp.json().get("result", {}).get("list", [])
-    if len(rows) < 2:
-        return (float(rows[0]["openInterest"]), None) if rows else (None, None)
-    rows_sorted = sorted(rows, key=lambda r: int(r["timestamp"]))
-    prev_oi = float(rows_sorted[0]["openInterest"])
-    latest_oi = float(rows_sorted[-1]["openInterest"])
-    if prev_oi == 0:
-        return latest_oi, None
-    return latest_oi, ((latest_oi - prev_oi) / prev_oi) * 100
-
-
 def _oi_okx(ticker: str, period: str) -> Tuple[Optional[float], Optional[float]]:
     """OKX отдаёт только текущий снимок OI без истории -- тренд вернуть не можем (None)."""
     resp = requests.get(
@@ -136,15 +118,19 @@ def _oi_okx(ticker: str, period: str) -> Tuple[Optional[float], Optional[float]]
     return float(data[0]["oi"]), None
 
 
-_OI_SOURCES = [("Binance", _oi_binance), ("Bybit", _oi_bybit), ("OKX", _oi_okx)]
+_OI_SOURCES = [("Binance", _oi_binance), ("OKX", _oi_okx)]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_open_interest_change(ticker: str, period: str = "1h") -> Tuple[Optional[float], Optional[float]]:
-    """(latest_oi, pct_change). Пробует Binance -> Bybit -> OKX -> (None, None)."""
+    """(latest_oi, pct_change). Пробует Binance -> OKX -> (None, None)."""
     for name, fn in _OI_SOURCES:
+        if name == "Binance" and _binance_futures_blocked[0]:
+            continue  # уже знаем, что регион заблокирован -- не тратим запрос
         try:
             return fn(ticker, period)
         except Exception as e:
+            if name == "Binance":
+                _mark_binance_blocked_if_geo(e)
             logger.warning(f"{name} OI недоступен для {ticker}: {e}")
     return None, None
